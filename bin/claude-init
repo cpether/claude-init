@@ -108,6 +108,9 @@ async function cmdMcp(args) {
       console.log(dim(`Skipped ${name}; ${result.skippedSecret} was not configured.`));
     } else {
       console.log(green(`wrapped ${name} at ${result.scope} scope`));
+      if (result.transport === 'http') {
+        console.log(dim('  http transport converted to an mcp-remote stdio proxy — needs npx + mcp-remote on PATH at launch'));
+      }
       if (result.argvWarnings && result.argvWarnings.length) {
         console.log(yellow(`warning: argv references remain: ${result.argvWarnings.map((v) => '${' + v + '}').join(', ')}`));
       }
@@ -392,12 +395,13 @@ async function cmdSecret(args) {
 
 async function cmdExec() {
   const dashIdx = process.argv.indexOf('--');
-  if (dashIdx < 0) die('usage: claude-init exec [ENV_KEY=]<NAME>... -- <command> [args...]');
-  const tokens = process.argv.slice(3, dashIdx);
+  if (dashIdx < 0) die('usage: claude-init exec [--inject-argv] [ENV_KEY=]<NAME>... -- <command> [args...]');
+  const { secretTokens: tokens, injectArgv } = migrate.parseExecArgv(process.argv.slice(3, dashIdx));
   const cmd = process.argv.slice(dashIdx + 1);
   if (cmd.length === 0) die('no command after --');
   const { root } = ctx();
   const env = { ...process.env };
+  const resolved = [];
   for (const tok of tokens) {
     let envKey, secretName;
     if (tok.includes('=')) {
@@ -410,10 +414,17 @@ async function cmdExec() {
     }
     const r = secretsResolve.resolve(root, secretName);
     if (!r) die(`secret ${secretName} not found (project or user). Run: claude-init secret set ${secretName}`);
-    try { env[envKey] = backends[r.ref.backend].get({ ref: r.ref }); }
+    let value;
+    try { value = backends[r.ref.backend].get({ ref: r.ref }); }
     catch (err) { die(`failed to read ${secretName}: ${err.message}`); }
+    env[envKey] = value;
+    resolved.push({ envKey, value });
   }
-  const r = spawnSync(cmd[0], cmd.slice(1), { stdio: 'inherit', env });
+  // Only when the wrapper opted in (--inject-argv) do we also materialise resolved values into the
+  // command args, for argv-only consumers like mcp-remote --header that don't read secrets from env.
+  // Plain stdio wrappers skip this so a literal $VAR in an arg is never leaked into argv / `ps`.
+  const finalCmd = injectArgv ? migrate.injectArgSecrets(cmd, resolved) : cmd;
+  const r = spawnSync(finalCmd[0], finalCmd.slice(1), { stdio: 'inherit', env });
   process.exit(r.status ?? 1);
 }
 

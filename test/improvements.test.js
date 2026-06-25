@@ -12,6 +12,7 @@ process.env.HOME = home;
 
 const picker = require('../lib/picker');
 const wizard = require('../lib/wizard');
+const migrate = require('../lib/migrate');
 const writers = require('../lib/writers');
 const detectNew = require('../lib/detect-new');
 const manifestLib = require('../lib/manifest');
@@ -28,7 +29,9 @@ function readJson(filePath) {
 function makeRepo(name) {
   const repo = path.join(tmpRoot, name);
   fs.mkdirSync(path.join(repo, '.git'), { recursive: true });
-  return repo;
+  // The CLI canonicalises cwd via realpath (e.g. /var → /private/var on macOS); mirror that so
+  // project-scope keys written to ~/.claude.json match what the spawned CLI looks up.
+  return fs.realpathSync(repo);
 }
 
 function setClaudeJson(data) {
@@ -302,6 +305,39 @@ async function testCopiedUserShimCleanup() {
   assert.match(userMcp.command, /claude-init$/);
   assert.deepStrictEqual(userMcp.args, ['exec', 'TOKEN', '--', 'node', 'shim.js']);
   assert.deepStrictEqual(userMcp.env, {});
+}
+
+async function testShimCleanupRespectsInjectArgvFlag() {
+  // Regression: when BOTH copies are wrapped, the unwrapped-command fallback must not stand in for
+  // equivalence — it's blind to --inject-argv. A working flagful project wrapper and a flag-stripped
+  // (broken) user copy are NOT interchangeable, so cleanup must not drop the project copy.
+  const repo = makeRepo('shim-flag');
+  const httpCfg = {
+    url: 'https://mcp.atlassian.com/v1/mcp',
+    type: 'http',
+    headers: { Authorization: 'Basic $BITBUCKET_TOKEN' },
+  };
+  const good = migrate.rewrap(httpCfg, migrate.planMigration(httpCfg), {
+    execCommand: 'claude-init',
+    mappings: [{ envKey: 'BITBUCKET_TOKEN', secretName: 'BITBUCKET_TOKEN' }],
+  });
+  assert.ok(good.args.includes('--inject-argv'));
+  const broken = { ...good, args: good.args.filter((a) => a !== '--inject-argv') };
+
+  // project copy = working (flagful); user copy = broken (flag stripped).
+  writeJson(path.join(repo, '.mcp.json'), { mcpServers: { bitbucket: good } });
+  setClaudeJson({ mcpServers: { bitbucket: broken } });
+
+  let prompted = false;
+  mockPicker({ confirm: async () => { prompted = true; return true; } });
+
+  const changed = await wizard.cleanupMaterializedUserShims(
+    repo, [{ name: 'bitbucket' }], [{ name: 'bitbucket' }], {},
+  );
+  assert.strictEqual(changed, false, 'must not clean up a non-equivalent both-wrapped pair');
+  assert.strictEqual(prompted, false, 'must not even prompt to remove the working project copy');
+  const stillThere = readJson(path.join(repo, '.mcp.json')).mcpServers.bitbucket;
+  assert.ok(stillThere.args.includes('--inject-argv'), 'working project wrapper must be preserved');
 }
 
 async function testRunInitRecordsKnownSnapshot() {
@@ -607,6 +643,189 @@ async function testCheckNoopWhenNothingNew() {
   assert.strictEqual(prompted, false, 'should not prompt when nothing is new');
 }
 
+function testHttpMigrationPlanAndRewrap() {
+  const cfg = {
+    url: 'https://mcp.atlassian.com/v1/mcp',
+    type: 'http',
+    headers: { Authorization: 'Basic $BITBUCKET_TOKEN' },
+  };
+  const plan = migrate.planMigration(cfg);
+  assert.strictEqual(plan.canMigrate, true);
+  assert.strictEqual(plan.transport, 'http');
+  assert.deepStrictEqual(plan.secrets, ['BITBUCKET_TOKEN']);
+
+  const wrapped = migrate.rewrap(cfg, plan, {
+    execCommand: 'claude-init',
+    mappings: [{ envKey: 'BITBUCKET_TOKEN', secretName: 'BITBUCKET_TOKEN' }],
+  });
+  assert.deepStrictEqual(wrapped, {
+    type: 'stdio',
+    command: 'claude-init',
+    args: [
+      // --inject-argv opts this mcp-remote wrapper into argv substitution; stdio wrappers omit it.
+      'exec', '--inject-argv', 'BITBUCKET_TOKEN', '--',
+      'npx', '-y', 'mcp-remote',
+      'https://mcp.atlassian.com/v1/mcp',
+      // Bare $VAR (not ${VAR}): Claude Code ignores it at parse time; exec injects the value at launch.
+      '--header', 'Authorization: Basic $BITBUCKET_TOKEN',
+    ],
+    env: {},
+  });
+
+  // A braced ${VAR} in the source config is normalised to the bare form so Claude Code never expands it.
+  // rewrapHttp reads headers from the plan (not cfg), so the plan must be recomputed from the braced
+  // config — otherwise this reuses the non-braced plan above and the assertion passes without exercising
+  // braced normalisation at all.
+  const bracedCfg = {
+    url: 'https://mcp.atlassian.com/v1/mcp',
+    type: 'http',
+    headers: { Authorization: 'Basic ${BITBUCKET_TOKEN}' },
+  };
+  const bracedPlan = migrate.planMigration(bracedCfg);
+  const braced = migrate.rewrap(bracedCfg, bracedPlan, {
+    execCommand: 'claude-init',
+    mappings: [{ envKey: 'BITBUCKET_TOKEN', secretName: 'BITBUCKET_TOKEN' }],
+  });
+  assert.ok(braced.args.includes('Authorization: Basic $BITBUCKET_TOKEN'));
+
+  // A backend secret stored under a different name keeps the header's env key but remaps the lookup.
+  const remapped = migrate.rewrap(cfg, plan, {
+    execCommand: 'claude-init',
+    mappings: [{ envKey: 'BITBUCKET_TOKEN', secretName: 'ATLASSIAN_PAT' }],
+  });
+  // The opt-in flag sits at index 1, so the remapped secret token follows it.
+  assert.strictEqual(remapped.args[1], '--inject-argv');
+  assert.strictEqual(remapped.args[2], 'BITBUCKET_TOKEN=ATLASSIAN_PAT');
+  assert.ok(remapped.args.includes('Authorization: Basic $BITBUCKET_TOKEN'));
+
+  // http with no secret references is still rejected — nothing to inject.
+  const noRefs = migrate.planMigration({ url: 'https://example.com/mcp', type: 'http' });
+  assert.strictEqual(noRefs.canMigrate, false);
+
+  // Regression (Finding 2): a literal OData-style $option in the URL is NOT a secret. A bogus secret
+  // here would make a non-secret URL migration-eligible and prompt for a credential that doesn't exist.
+  const odata = migrate.planMigration({ url: 'https://api.example/mcp?$filter=status', type: 'http' });
+  assert.strictEqual(odata.canMigrate, false, '$filter in a URL must not be treated as a secret');
+
+  // …but genuine env-style ($TENANT) and braced (${API_TOKEN}) URL refs are still detected.
+  assert.deepStrictEqual(migrate.collectUrlSecretRefs('https://$TENANT.example/mcp?$filter=x'), ['TENANT']);
+  assert.deepStrictEqual(migrate.collectUrlSecretRefs('https://api.example/${API_TOKEN}'), ['API_TOKEN']);
+}
+
+function testInjectArgSecrets() {
+  const resolved = [
+    { envKey: 'BITBUCKET_TOKEN', value: 'p@ss$word' },
+    { envKey: 'TENANT', value: 'acme' },
+  ];
+  const out = migrate.injectArgSecrets(
+    ['--header', 'Authorization: Basic $BITBUCKET_TOKEN', 'https://$TENANT.example/${TENANT}', '$BITBUCKET_TOKEN_EXTRA'],
+    resolved,
+  );
+  assert.deepStrictEqual(out, [
+    '--header',
+    'Authorization: Basic p@ss$word',
+    'https://acme.example/acme',
+    '$BITBUCKET_TOKEN_EXTRA', // word-boundary guard: a longer identifier is not substituted
+  ]);
+
+  // A value containing $-sequences must be inserted literally (not treated as replace() patterns).
+  assert.deepStrictEqual(migrate.injectArgSecrets(['x=$A'], [{ envKey: 'A', value: '$1$&' }]), ['x=$1$&']);
+
+  // Single-pass guard: a value that contains another key's reference must be inserted literally, not
+  // rescanned. With A=abc$B and B=XYZ, the arg $A resolves to the literal abc$B — never abcXYZ.
+  assert.deepStrictEqual(
+    migrate.injectArgSecrets(['$A'], [{ envKey: 'A', value: 'abc$B' }, { envKey: 'B', value: 'XYZ' }]),
+    ['abc$B'],
+  );
+
+  // No resolved secrets → args pass through untouched.
+  assert.deepStrictEqual(migrate.injectArgSecrets(['$A', 'b'], []), ['$A', 'b']);
+}
+
+function testArgvInjectionIsOptIn() {
+  // Regression (Finding 1): argv substitution must be gated behind --inject-argv. A plain stdio wrapper
+  // (env secret TOKEN + a literal $TOKEN arg) must NOT carry the flag, so exec leaves its argv untouched
+  // and never materialises the secret into the command line (which `ps` would expose).
+  const stdioCfg = { type: 'stdio', command: 'node', args: ['server.js', '$TOKEN'], env: { TOKEN: '$TOKEN' } };
+  const stdioPlan = migrate.planMigration(stdioCfg);
+  const stdioWrapped = migrate.rewrap(stdioCfg, stdioPlan, {
+    execCommand: 'claude-init',
+    mappings: [{ envKey: 'TOKEN', secretName: 'TOKEN' }],
+  });
+  assert.ok(!stdioWrapped.args.includes(migrate.INJECT_ARGV_FLAG), 'stdio wrappers must not opt into argv injection');
+
+  // parseExecArgv splits the opt-in flag from the secret tokens and reports the injection decision.
+  assert.deepStrictEqual(
+    migrate.parseExecArgv(['--inject-argv', 'BITBUCKET_TOKEN']),
+    { secretTokens: ['BITBUCKET_TOKEN'], injectArgv: true },
+  );
+  assert.deepStrictEqual(
+    migrate.parseExecArgv(['TOKEN', 'OTHER=NAME']),
+    { secretTokens: ['TOKEN', 'OTHER=NAME'], injectArgv: false },
+  );
+
+  // The flag survives a secret-name remap (the `mcp move` path) so the wrapper keeps injecting.
+  const httpWrapped = migrate.rewrap(
+    { url: 'https://mcp.atlassian.com/v1/mcp', type: 'http', headers: { Authorization: 'Basic $BITBUCKET_TOKEN' } },
+    migrate.planMigration({ url: 'https://mcp.atlassian.com/v1/mcp', type: 'http', headers: { Authorization: 'Basic $BITBUCKET_TOKEN' } }),
+    { execCommand: 'claude-init', mappings: [{ envKey: 'BITBUCKET_TOKEN', secretName: 'BITBUCKET_TOKEN' }] },
+  );
+  const remapped = migrate.rewriteWrappedTokens(httpWrapped, [{ envKey: 'BITBUCKET_TOKEN', secretName: 'ATLASSIAN_PAT' }]);
+  assert.ok(remapped.args.includes(migrate.INJECT_ARGV_FLAG), 'remap must preserve --inject-argv');
+  assert.deepStrictEqual(migrate.readWrappedTokens(remapped), [{ envKey: 'BITBUCKET_TOKEN', secretName: 'ATLASSIAN_PAT' }]);
+
+  // The flag is part of equivalence identity: a working wrapper (with --inject-argv) and an otherwise
+  // identical broken one (flag stripped) must NOT be equivalent. Collision cleanup (`mcp move`) relies
+  // on this — otherwise it could drop the working copy and keep one that forwards a literal $TOKEN.
+  const flagless = { ...httpWrapped, args: httpWrapped.args.filter((a) => a !== migrate.INJECT_ARGV_FLAG) };
+  assert.ok(!migrate.equivalent(httpWrapped, flagless), 'flag presence must affect equivalence');
+  assert.ok(migrate.equivalent(httpWrapped, { ...httpWrapped, args: [...httpWrapped.args] }), 'identical wrappers stay equivalent');
+}
+
+async function testWrapsHttpServerViaMcpRemote() {
+  const repo = makeRepo('http-wrap');
+  writeJson(path.join(repo, '.claude', '.claude-init.json'), {
+    version: 1,
+    mcps: [],
+    skills: [],
+    secrets: {
+      BITBUCKET_TOKEN: { backend: 'op', ref: 'op://Test/Bitbucket/credential' },
+    },
+  });
+  setClaudeJson({
+    mcpServers: {
+      bitbucket: {
+        url: 'https://mcp.atlassian.com/v1/mcp',
+        type: 'http',
+        headers: { Authorization: 'Basic $BITBUCKET_TOKEN' },
+      },
+    },
+  });
+
+  mockPicker({
+    select: async ({ choices }) => {
+      const useExisting = choices.find((choice) => choice.value === 'use');
+      return (useExisting || choices[0]).value;
+    },
+  });
+
+  const projData = manifestLib.read(repo);
+  const result = await wizard.wrapMcpByName(repo, 'bitbucket', projData);
+  assert.strictEqual(result.status, 'wrapped');
+
+  const wrapped = readJson(path.join(home, '.claude.json')).mcpServers.bitbucket;
+  assert.match(wrapped.command, /claude-init$/);
+  assert.deepStrictEqual(wrapped.args, [
+    'exec', '--inject-argv', 'BITBUCKET_TOKEN', '--',
+    'npx', '-y', 'mcp-remote',
+    'https://mcp.atlassian.com/v1/mcp',
+    '--header', 'Authorization: Basic $BITBUCKET_TOKEN',
+  ]);
+  assert.strictEqual(wrapped.type, 'stdio');
+  assert.strictEqual(wrapped.url, undefined, 'stale http url must be dropped');
+  assert.strictEqual(wrapped.headers, undefined, 'stale headers must be dropped');
+}
+
 function testInvalidJsonIsNotOverwritten() {
   const repo = makeRepo('invalid-json');
   const target = path.join(repo, '.mcp.json');
@@ -626,6 +845,7 @@ function testInvalidJsonIsNotOverwritten() {
   await testInitMigratesProjectDollarEnvReference();
   testProjectMcpEnableDisableCliUsesSettingsJson();
   await testCopiedUserShimCleanup();
+  await testShimCleanupRespectsInjectArgvFlag();
   await testRunInitRecordsKnownSnapshot();
   testDetectFlagsNewUserMcp();
   testDetectQuietWhenNothingNew();
@@ -638,6 +858,10 @@ function testInvalidJsonIsNotOverwritten() {
   testMcpMoveRefreshesKnown();
   await testCheckNoopAfterMove();
   await testCheckNoopWhenNothingNew();
+  testHttpMigrationPlanAndRewrap();
+  testInjectArgSecrets();
+  testArgvInjectionIsOptIn();
+  await testWrapsHttpServerViaMcpRemote();
   testInvalidJsonIsNotOverwritten();
   console.log('improvements tests passed');
 })().catch((err) => {

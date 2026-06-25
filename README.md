@@ -105,6 +105,33 @@ Rewrites an existing user, project, or local MCP in place to run through `claude
 
 The `init` wizard also offers this migration when it discovers existing user, project, or local MCPs with `${SECRET}` env references.
 
+### Wrapping `http`/`sse` servers
+
+An `http` or `sse` server has no subprocess for the `exec` wrapper to inject env into — Claude Code opens the connection itself. When such a server references a secret in its `url` or `headers` (e.g. `"Authorization": "Basic $BITBUCKET_TOKEN"`), `wrap` converts the transport to a locally-spawned [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) stdio proxy:
+
+```json
+{
+  "mcpServers": {
+    "bitbucket": {
+      "type": "stdio",
+      "command": "claude-init",
+      "args": ["exec", "--inject-argv", "BITBUCKET_TOKEN", "--", "npx", "-y", "mcp-remote",
+               "https://mcp.atlassian.com/v1/mcp",
+               "--header", "Authorization: Basic $BITBUCKET_TOKEN"],
+      "env": {}
+    }
+  }
+}
+```
+
+The secret is left as a **bare `$BITBUCKET_TOKEN`** on purpose. Claude Code expands `${VAR}` (braces) at config-parse time and **fails to load the config if the variable is missing** — but it ignores bare `$VAR`, so the reference survives the parser. `mcp-remote` does no variable expansion of its own (it forwards `--header` values verbatim), so `claude-init exec` resolves `BITBUCKET_TOKEN` from your backend and substitutes the value into the args just before spawning the proxy.
+
+The leading **`--inject-argv`** flag is what opts this wrapper into that argv substitution. Only these proxy wrappers (`mcp-remote` and other argv-only consumers) carry it — plain stdio wraps omit it, so a literal `$VAR` in a stdio command's args is passed through untouched and the secret is delivered solely via the environment (never the command line). Without the flag, `claude-init exec` would set `BITBUCKET_TOKEN` in env but leave the `--header` value as the literal `$BITBUCKET_TOKEN` placeholder, which `mcp-remote` would forward verbatim.
+
+Requirements / caveats:
+- `npx` and `mcp-remote` must be on PATH when Claude Code starts.
+- Because `mcp-remote` only accepts the header on the command line, the resolved token is present in the proxy process's argv at runtime (visible to `ps`) — unlike stdio wraps, which keep secrets in the environment.
+
 ## Secret resolution
 
 When `claude-init exec` runs, it resolves each requested name in order:
